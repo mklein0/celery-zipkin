@@ -8,6 +8,7 @@ import collections
 import platform as _platform
 from socket import gethostname
 import threading
+import urlparse
 
 from py_zipkin import zipkin
 
@@ -33,7 +34,7 @@ def http_transport(encoded_span):
 ZIPKIN_THRIFT_PREAMBLE = '\x0c\x00\x00\x00\x01'.encode()
 
 
-_ZipkinState = collections.namedtuple('_ZipkinState', 'call rpc run wire results')
+_ZipkinState = collections.namedtuple('_ZipkinState', 'call rpc run')
 
 _local = threading.local()
 
@@ -63,6 +64,26 @@ def get_task_from_app(app, name):
     return task
 
 
+def get_task_backend_name(task, is_eager=False):
+    # type: (celery.app.task.Task, bool) -> str
+    if is_eager:
+        backend = 'is_eager'
+
+    else:
+        try:
+            backend = urlparse.urlparse(task.backend.url)
+            if backend.port:
+                netloc = '{}:{}'.format(backend.hostname, backend.port)
+            else:
+                netloc = backend.hostname
+            backend = urlparse.urlunsplit((backend.scheme, netloc, backend.url, backend.query, backend.fragment))
+
+        except AttributeError:
+            backend = repr(type(task.backend))
+
+    return backend
+
+
 class CeleryAppZipkinInstrumentation(object):
 
     def __init__(self, http_transport, sample_rate=None):
@@ -86,8 +107,6 @@ class CeleryAppZipkinInstrumentation(object):
         signals.task_postrun.connect(weak=False)(self.task_postrun_handler)
 
         try:
-            signals.before_result_publish.connect(weak=False)(self.result_sending_handler)
-            signals.after_result_publish.connect(weak=False)(self.result_sent_handler)
             signals.after_result_received.connect(weak=False)(self.result_received_handler)
 
             self._has_result_event = True
@@ -99,8 +118,8 @@ class CeleryAppZipkinInstrumentation(object):
     def stop(self):
         pass
 
-    def _start_call_span(self, sender, task_id):
-        # type: (str, str) -> py_zipkin.zipkin.server_span
+    def _start_call_span(self, app, sender, task_id):
+        # type: (celery.app.Celery, str, str) -> py_zipkin.zipkin.server_span
 
         zipkin_attrs = zipkin.get_zipkin_attrs()  # type: py_zipkin.zipkin.ZipkinAttrs
         """:type: py_zipkin.zipkin.ZipkinAttrs"""
@@ -117,9 +136,21 @@ class CeleryAppZipkinInstrumentation(object):
         else:
             zipkin_attrs = zipkin.create_attrs_for_span(self.sample_rate)
 
+        # Get task definition to see if task ignores result
+        task = get_task_from_app(app, sender)
+
+        # Is Call Complete at this point.
+        if task.ignore_result or not self._has_result_event:
+            call_type = 'async'
+            backend = None
+
+        else:
+            call_type = 'call'
+            backend = get_task_backend_name(task, is_eager)
+
         span = zipkin.zipkin_server_span(
             service_name='celery.{}'.format(sender.split('.',1)[0]),
-            span_name='task.call.{}'.format(sender),
+            span_name='task.{}:{}'.format(call_type, sender),
             transport_handler=self.transport_handler,
             sample_rate=self.sample_rate,
             zipkin_attrs=zipkin_attrs,
@@ -131,6 +162,9 @@ class CeleryAppZipkinInstrumentation(object):
 
         span.start()
         span.update_binary_annotations_for_root_span({
+            'celery.task.name': sender,
+            'celery.task.type': call_type,
+            'celery.task.backend': backend,
             'celery.machine': self._hostname,
             'celery.platform': self._platform,
         })
@@ -159,41 +193,7 @@ class CeleryAppZipkinInstrumentation(object):
         span.start()
         return span
 
-    def _start_wire_send(self, span_name, sender, task_id, zipkin_attrs=None):
-        # type: (str, str, str, py_zipkin.zipkin.ZipkinAttrs) -> py_zipkin.zipkin.client_span
-
-        if zipkin_attrs is None:
-            zipkin_attrs = zipkin.get_zipkin_attrs()
-
-        if zipkin_attrs:
-            zipkin_attrs = zipkin.ZipkinAttrs(
-                trace_id=zipkin_attrs.trace_id,
-                span_id=zipkin.generate_random_64bit_string(),
-                parent_span_id=zipkin_attrs.span_id,
-                flags=zipkin_attrs.flags,
-                is_sampled=zipkin_attrs.is_sampled,
-            )
-
-        else:
-            zipkin_attrs = zipkin.create_attrs_for_span(self.sample_rate)
-
-        span = zipkin.zipkin_client_span(
-            service_name='celery.{}'.format(sender.split('.',1)[0]),
-            span_name=span_name,
-            transport_handler=self.transport_handler,
-            sample_rate=self.sample_rate,
-            zipkin_attrs=zipkin_attrs,
-        )
-
-        span.start()
-        span.update_binary_annotations_for_root_span({
-            'celery.machine': self._hostname,
-            'celery.platform': self._platform,
-        })
-
-        return span
-
-    def _start_taskrun_span(self, sender, span_id=None, trace_id=None, parent_id=None, flags=None, is_sampled=None):
+    def _start_taskrun_span(self, sender, task, span_id=None, trace_id=None, parent_id=None, flags=None, is_sampled=None):
         # type: (str, str, str, str, str, str) -> py_zipkin.zipkin.server_span
 
         zipkin_attrs = zipkin.get_zipkin_attrs()  # type: py_zipkin.zipkin.ZipkinAttrs
@@ -211,16 +211,34 @@ class CeleryAppZipkinInstrumentation(object):
 
         span = zipkin.zipkin_server_span(
             service_name='celery.{}'.format(sender.split('.',1)[0]),
-            span_name='task.run.{}'.format(sender),
+            span_name='task.run:{}'.format(sender),
             transport_handler=self.transport_handler,
             sample_rate=self.sample_rate,
             zipkin_attrs=zipkin_attrs,
         )
 
+        backend = None
+        context = task.request
+        is_eager = context.get('is_eager', False)
+        if task.ignore_result or not self._has_result_event:
+            call_type = 'async'
+        else:
+            call_type = 'call'
+            if is_eager:
+                backend = 'is_eager'
+
+            else:
+                backend = get_task_backend_name(task, is_eager)
+
         span.start()
         span.update_binary_annotations_for_root_span({
-            'celery.machine': self._hostname,
+            'celery.task.name': sender,
+            'celery.task.type': call_type,
+            'celery.task.backend': backend,
+            'celery.machine': context.get('hostname', self._hostname),
+            'celery.is_eager': context.get('is_eager', False),
             'celery.platform': self._platform,
+
         })
 
         return span
@@ -238,33 +256,27 @@ class CeleryAppZipkinInstrumentation(object):
 
         # Else, Protocol 2
         task_id = headers['id']  # task_id
-        print task_id
 
+        app = current_app
         zipkin_state = get_zipkin_state()
 
         # No information on if ignore result is set.
-        zipkin_attrs = None
-        if self._has_result_event:
-            call_span = self._start_call_span(sender=sender, task_id=task_id)
-            zipkin_state.call[task_id] = call_span
-            zipkin_attrs = call_span.zipkin_attrs
+        call_span = self._start_call_span(app, sender=sender, task_id=task_id)
+        zipkin_state.call[task_id] = call_span
+        zipkin_attrs = call_span.zipkin_attrs
 
-            # RPC Call
-            # No information on if ignore result is set.
-            rpc_span = self._start_rpc_span(sender=sender, zipkin_attrs=zipkin_attrs)
-            zipkin_fields = {
-                'x_b3_traceid': rpc_span.zipkin_attrs.trace_id,
-                'x_b3_spanid': rpc_span.zipkin_attrs.span_id,
-                'x_b3_parentspanid': rpc_span.zipkin_attrs.parent_span_id,
-                'x_b3_flags': rpc_span.zipkin_attrs.flags,
-                'x_b3_sampled': rpc_span.zipkin_attrs.is_sampled,
-            }
-            headers.update(zipkin_fields)
-            zipkin_state.rpc[task_id] = rpc_span
-
-        wire_span = self._start_wire_send(
-            'task.send.{}'.format(sender), sender=sender, task_id=task_id, zipkin_attrs=zipkin_attrs)
-        zipkin_state.wire[task_id] = wire_span
+        # RPC Call
+        # No information on if ignore result is set.
+        rpc_span = self._start_rpc_span(sender=sender, zipkin_attrs=zipkin_attrs)
+        zipkin_fields = {
+            'x_b3_traceid': rpc_span.zipkin_attrs.trace_id,
+            'x_b3_spanid': rpc_span.zipkin_attrs.span_id,
+            'x_b3_parentspanid': rpc_span.zipkin_attrs.parent_span_id,
+            'x_b3_flags': rpc_span.zipkin_attrs.flags,
+            'x_b3_sampled': rpc_span.zipkin_attrs.is_sampled,
+        }
+        headers.update(zipkin_fields)
+        zipkin_state.rpc[task_id] = rpc_span
 
     def task_sent_handler(self, sender=None, headers=None, **kwargs):
         """
@@ -289,15 +301,12 @@ class CeleryAppZipkinInstrumentation(object):
         app = current_app
         zipkin_state = get_zipkin_state()
 
-        wire_span = zipkin_state.wire.pop(task_id, None)
-        if wire_span:
-            wire_span.stop()
-
         # Get task definition to see if task ignores result
         task = get_task_from_app(app, sender)
 
-        # Call Complete at this point.
-        if task.ignore_result:
+        # Is Call Complete at this point.
+        if task.ignore_result or not self._has_result_event:
+            # If no result event available, treat all calls as an async event
             rpc_span = zipkin_state.rpc.pop(task_id, None)
             if rpc_span:
                 rpc_span.stop()
@@ -316,6 +325,7 @@ class CeleryAppZipkinInstrumentation(object):
         """:type: celery.app.task.Context"""
 
         task_span = self._start_taskrun_span(
+            task=task,
             sender=task.name,
             trace_id=context.get('x_b3_traceid'),
             parent_id=context.get('x_b3_parentspanid'),
@@ -331,7 +341,7 @@ class CeleryAppZipkinInstrumentation(object):
         else:
             task.zipkin_span = task_span
 
-    def task_postrun_handler(self, task_id=None, task=None, **kwargs):
+    def task_postrun_handler(self, task_id=None, task=None, state=None, **kwargs):
         """
         This is a server send of the work request.  There may be a retry of this request.
         """
@@ -346,26 +356,13 @@ class CeleryAppZipkinInstrumentation(object):
 
         task_span = zipkin_state.run.pop(task_id, None)
         if task_span:
+            task_span.update_binary_annotations_for_root_span({
+                'celery.task.status': state,
+            })
             task_span.stop()
 
-    def result_sending_handler(self, sender=None, task_id=None, **kwargs):
-        # information about task are located in headers for task messages
-        # using the task protocol version 2.
-        # http://docs.celeryproject.org/en/latest/internals/protocol.html
-        zipkin_state = get_zipkin_state()
-
-        wire_span = self._start_wire_send(
-            'task.result.{}'.format(sender.name), sender=sender.name, task_id=task_id)
-        zipkin_state.results[task_id] = wire_span
-
-    def result_sent_handler(self, task_id=None, **kwargs):
-        zipkin_state = get_zipkin_state()
-
-        task_span = zipkin_state.results.pop(task_id, None)
-        if task_span:
-            task_span.stop()
-
-    def result_received_handler(self, task_id=None, **kwargs):
+    def result_received_handler(self, task_id=None, payload=None, **kwargs):
+        import ipdb; ipdb.set_trace()
         zipkin_state = get_zipkin_state()
 
         task_span = zipkin_state.rpc.pop(task_id, None)
@@ -374,4 +371,7 @@ class CeleryAppZipkinInstrumentation(object):
 
         task_span = zipkin_state.call.pop(task_id, None)
         if task_span:
+            task_span.update_binary_annotations_for_root_span({
+                'celery.task.status': payload.get('status'),
+            })
             task_span.stop()
