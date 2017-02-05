@@ -19,7 +19,7 @@ def read_version(fobj):
 
 HERE = os.path.abspath(os.path.dirname(__file__))
 
-with open(os.path.join(HERE, 'celery_zipkin', '__init__.py')) as f:
+with open(os.path.join(HERE, 'celery_zipkin.py')) as f:
     module_version = read_version(f)
 
 with open(os.path.join(HERE, 'README.rst')) as f:

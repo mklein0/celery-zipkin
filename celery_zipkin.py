@@ -375,3 +375,5 @@ class CeleryAppZipkinInstrumentation(object):
                 'celery.task.status': payload.get('status'),
             })
             task_span.stop()
+
+__version__ = '0.1.0'
