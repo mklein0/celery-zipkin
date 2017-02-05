@@ -1,5 +1,5 @@
 ##############
-PyMongo-Zipkin
+Celery-Zipkin
 ##############
 
 An zipkin extension for the Celery library based on py\_zipkin.
