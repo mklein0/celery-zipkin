@@ -11,7 +11,7 @@ Installation
 
 .. code-block:: bash
 
-  pip install 'git+https://github.com/mklein0/celery-zipkin.git#egg=Celery-Zipkin'
+  pip install Celery-Zipkin
 
 
 *****
