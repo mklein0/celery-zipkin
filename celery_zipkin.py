@@ -161,7 +161,7 @@ class CeleryAppZipkinInstrumentation(object):
         print span.zipkin_attrs
 
         span.start()
-        span.update_binary_annotations_for_root_span({
+        span.update_binary_annotations({
             'celery.task.name': sender,
             'celery.task.type': call_type,
             'celery.task.backend': backend,
@@ -231,7 +231,7 @@ class CeleryAppZipkinInstrumentation(object):
                 backend = get_task_backend_name(task, is_eager)
 
         span.start()
-        span.update_binary_annotations_for_root_span({
+        span.update_binary_annotations({
             'celery.task.name': sender,
             'celery.task.type': call_type,
             'celery.task.backend': backend,
@@ -356,13 +356,12 @@ class CeleryAppZipkinInstrumentation(object):
 
         task_span = zipkin_state.run.pop(task_id, None)
         if task_span:
-            task_span.update_binary_annotations_for_root_span({
+            task_span.update_binary_annotations({
                 'celery.task.status': state,
             })
             task_span.stop()
 
     def result_received_handler(self, task_id=None, payload=None, **kwargs):
-        import ipdb; ipdb.set_trace()
         zipkin_state = get_zipkin_state()
 
         task_span = zipkin_state.rpc.pop(task_id, None)
@@ -371,7 +370,7 @@ class CeleryAppZipkinInstrumentation(object):
 
         task_span = zipkin_state.call.pop(task_id, None)
         if task_span:
-            task_span.update_binary_annotations_for_root_span({
+            task_span.update_binary_annotations({
                 'celery.task.status': payload.get('status'),
             })
             task_span.stop()
